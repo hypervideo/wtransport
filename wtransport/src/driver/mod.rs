@@ -537,12 +537,12 @@ mod worker {
                 Err(mpsc::error::SendError(_)) => return Err(DriverError::NotConnected),
             };
 
-            let quic_dgram = quic_connection
-                .read_datagram()
+            let (quic_dgram, rx_time) = quic_connection
+                .read_datagram_with_meta()
                 .await
                 .map_err(|_| DriverError::NotConnected)?;
 
-            let datagram = match Datagram::read(quic_dgram) {
+            let datagram = match Datagram::read(quic_dgram, rx_time) {
                 Ok(datagram) => datagram,
                 Err(error_code) => return Err(DriverError::Proto(error_code)),
             };
