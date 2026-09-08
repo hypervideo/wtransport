@@ -11,6 +11,7 @@ pub struct Datagram {
     quic_dgram: Bytes,
     payload_offset: usize,
     session_id: SessionId,
+    rx_time: Option<std::time::SystemTime>,
 }
 
 impl Datagram {
@@ -20,7 +21,21 @@ impl Datagram {
         self.quic_dgram.slice(self.payload_offset..)
     }
 
-    pub(crate) fn read(quic_dgram: Bytes) -> Result<Self, ErrorCode> {
+    /// Kernel software receive timestamp of the UDP datagram this arrived in,
+    /// if the socket layer captured one (`None` for outgoing datagrams or
+    /// platforms without timestamp support).
+    ///
+    /// Lets a delay-based congestion controller observe accurate inter-arrival
+    /// spacing instead of userspace drain time.
+    #[inline(always)]
+    pub fn rx_time(&self) -> Option<std::time::SystemTime> {
+        self.rx_time
+    }
+
+    pub(crate) fn read(
+        quic_dgram: Bytes,
+        rx_time: Option<std::time::SystemTime>,
+    ) -> Result<Self, ErrorCode> {
         let h3dgram = H3Datagram::read(&quic_dgram)?;
         let payload_offset = quic_dgram.len() - h3dgram.payload().len();
         let session_id = h3dgram.qstream_id().into_session_id();
@@ -29,6 +44,7 @@ impl Datagram {
             quic_dgram,
             payload_offset,
             session_id,
+            rx_time,
         })
     }
 
@@ -46,6 +62,7 @@ impl Datagram {
             quic_dgram,
             payload_offset,
             session_id,
+            rx_time: None,
         }
     }
 
@@ -72,5 +89,26 @@ impl Deref for Datagram {
     #[inline(always)]
     fn deref(&self) -> &Self::Target {
         &self.quic_dgram[self.payload_offset..]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, UNIX_EPOCH};
+    use wtransport_proto::{ids::StreamId, varint::VarInt};
+
+    #[test]
+    fn receive_timestamp_is_preserved() {
+        let session_id = SessionId::try_from_session_stream(StreamId::new(VarInt::from_u32(0)))
+            .expect("stream zero is a valid session stream");
+        let outgoing = Datagram::write(session_id, b"payload");
+        assert_eq!(outgoing.rx_time(), None);
+
+        let rx_time = UNIX_EPOCH + Duration::from_secs(1);
+        let received = Datagram::read(outgoing.into_quic_bytes(), Some(rx_time)).unwrap();
+
+        assert_eq!(received.payload(), &b"payload"[..]);
+        assert_eq!(received.rx_time(), Some(rx_time));
     }
 }
