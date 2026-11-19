@@ -795,3 +795,88 @@ impl SessionRequest {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Identity;
+    use std::time::Duration;
+    use wtransport_proto::settings::Settings;
+
+    /// The server reads a client's SETTINGS frame whole when the frame arrives in two parts with the
+    /// client's CONNECT stream in between.
+    ///
+    /// The CONNECT stream finishes another branch of the driver's `select!` while the SETTINGS read
+    /// waits for the rest of its frame. A plain QUIC client sends the frame type, the CONNECT request
+    /// and the rest of the frame in that order. Nothing tells the client when the server has read
+    /// what it sent, so it waits 100ms after the frame type and after the request.
+    #[tokio::test]
+    async fn settings_frame_split_by_connect_stream() {
+        let identity = Identity::self_signed(["localhost"]).unwrap();
+        let certificate_hash = identity.certificate_chain().as_slice()[0].hash();
+        let server = Endpoint::server(
+            ServerConfig::builder()
+                .with_bind_address("127.0.0.1:0".parse().unwrap())
+                .with_identity(identity)
+                .build(),
+        )
+        .unwrap();
+        let server_address = server.local_addr().unwrap();
+        let client_config = ClientConfig::builder()
+            .with_bind_default()
+            .with_server_certificate_hashes([certificate_hash])
+            .build();
+        let client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+
+        let mut settings = Vec::new();
+        Settings::builder()
+            .qpack_max_table_capacity(VarInt::from_u32(0))
+            .qpack_blocked_streams(VarInt::from_u32(0))
+            .enable_connect_protocol()
+            .enable_webtransport()
+            .enable_h3_datagrams()
+            .webtransport_max_sessions(VarInt::from_u32(1))
+            .build()
+            .generate_frame()
+            .write(&mut settings)
+            .unwrap();
+        let mut request = Vec::new();
+        SessionRequestProto::new(format!("https://localhost:{}/", server_address.port()))
+            .unwrap()
+            .headers()
+            .generate_frame()
+            .write(&mut request)
+            .unwrap();
+
+        let (session_request, _client) = tokio::join!(
+            async {
+                tokio::time::timeout(Duration::from_secs(5), server.accept().await)
+                    .await
+                    .expect("the server's handshake finishes")
+                    .expect("the server reads the client's SETTINGS")
+            },
+            async {
+                let connection = client
+                    .connect_with(
+                        client_config.quic_config.clone(),
+                        server_address,
+                        "localhost",
+                    )
+                    .unwrap()
+                    .await
+                    .unwrap();
+                let mut control = connection.open_uni().await.unwrap();
+                // The stream type of a control stream, then the type of the SETTINGS frame.
+                control.write_all(&[0x00]).await.unwrap();
+                control.write_all(&settings[..1]).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let (mut connect, connect_receive) = connection.open_bi().await.unwrap();
+                connect.write_all(&request).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                control.write_all(&settings[1..]).await.unwrap();
+                (connection, control, connect, connect_receive)
+            },
+        );
+        assert_eq!(session_request.path(), "/");
+    }
+}
