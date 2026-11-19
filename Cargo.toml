@@ -12,3 +12,9 @@ unused_qualifications = "warn"
 manual_is_variant_and = "warn"
 manual_let_else = "warn"
 unnecessary_cast = "deny"
+
+# The datagram receive timestamps come from quinn's `read_datagram_with_meta`, which only this quinn fork has. Cargo
+# applies only the root workspace's patches, so a crate that depends on this fork patches quinn the same way.
+[patch.crates-io]
+quinn = { git = "https://github.com/hypervideo/quinn", rev = "75bb946545b3434d74a22323d1e3d6a7a5d902e6" }
+quinn-proto = { git = "https://github.com/hypervideo/quinn", rev = "75bb946545b3434d74a22323d1e3d6a7a5d902e6" }
