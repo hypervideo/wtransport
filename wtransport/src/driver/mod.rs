@@ -9,6 +9,7 @@ use crate::driver::utils::shared_result;
 use crate::driver::utils::SendError;
 use crate::driver::utils::SharedResultGet;
 use crate::driver::utils::SharedResultSet;
+use crate::driver::utils::WeakResultSet;
 use crate::error::ApplicationClose;
 use crate::error::SendDatagramError;
 use crate::stream::OpeningBiStream;
@@ -41,8 +42,10 @@ pub struct Driver {
     ready_sessions: BiChannelEndpoint<StreamSession>,
     ready_uni_wt_streams: Mutex<mpsc::Receiver<StreamUniRemoteWT>>,
     ready_bi_wt_streams: Mutex<mpsc::Receiver<StreamBiRemoteWT>>,
-    ready_datagrams: Mutex<mpsc::Receiver<Datagram>>,
     driver_result: SharedResultGet<DriverError>,
+    /// Sets the driver's result when [`Self::receive_datagram`] finds a malformed datagram. A weak setter, so that a
+    /// worker that ends without a result, such as by a panic, still shows as one ([`Self::result`]).
+    driver_result_setter: WeakResultSet<DriverError>,
 }
 
 impl Driver {
@@ -51,8 +54,8 @@ impl Driver {
         let ready_sessions = bichannel(1);
         let ready_uni_wt_streams = mpsc::channel(4);
         let ready_bi_wt_streams = mpsc::channel(1);
-        let ready_datagrams = mpsc::channel(1);
         let driver_result = shared_result();
+        let driver_result_setter = driver_result.0.downgrade();
 
         tokio::spawn(
             worker::Worker::new(
@@ -61,7 +64,6 @@ impl Driver {
                 ready_sessions.0,
                 ready_uni_wt_streams.0,
                 ready_bi_wt_streams.0,
-                ready_datagrams.0,
                 driver_result.0,
             )
             .run()
@@ -74,8 +76,8 @@ impl Driver {
             ready_sessions: ready_sessions.1,
             ready_uni_wt_streams: Mutex::new(ready_uni_wt_streams.1),
             ready_bi_wt_streams: Mutex::new(ready_bi_wt_streams.1),
-            ready_datagrams: Mutex::new(ready_datagrams.1),
             driver_result: driver_result.1,
+            driver_result_setter,
         }
     }
 
@@ -169,12 +171,35 @@ impl Driver {
         }
     }
 
+    /// Receives the next datagram of the session `session_id` from the QUIC connection, and drops those of other
+    /// sessions.
+    ///
+    /// The datagrams go from quinn straight to the caller, without a hop through the worker. A caller that drops a
+    /// pending receive loses no datagram, but it must poll the same future again to be woken: quinn wakes only the
+    /// futures that wait at the time.
+    ///
+    /// A malformed datagram ends the driver with [`ErrorCode::Datagram`] and closes the connection with it, as RFC 9297
+    /// (section 2.1) asks. Once the connection has ended, a receive returns the driver's result rather than the
+    /// datagrams that quinn still holds.
     pub async fn receive_datagram(&self, session_id: SessionId) -> Result<Datagram, DriverError> {
-        let mut lock = self.ready_datagrams.lock().await;
-
         loop {
-            let Some(datagram) = lock.recv().await else {
+            // A read that finds a datagram waiting does not yield, so a caller that receives a backlog would hold its
+            // thread. The budget makes it yield now and then, as a channel receive would.
+            tokio::task::coop::consume_budget().await;
+
+            if self.driver_result.get().is_some() || self.quic_connection.close_reason().is_some() {
                 return Err(self.result().await);
+            }
+
+            let Ok((quic_datagram, rx_time)) = self.quic_connection.read_datagram_with_meta().await
+            else {
+                return Err(self.result().await);
+            };
+
+            // From here on nothing awaits, so a cancelled receive cannot drop the datagram that quinn handed out.
+            let datagram = match Datagram::read(quic_datagram, rx_time) {
+                Ok(datagram) => datagram,
+                Err(error_code) => return Err(self.fail(error_code)),
             };
 
             if datagram.session_id() == session_id {
@@ -227,6 +252,19 @@ impl Driver {
         }
     }
 
+    /// Ends the driver with the protocol error `error_code`, unless it has ended already, and returns its result.
+    ///
+    /// The result is set before the connection closes, so that the worker, which sees the closed connection, does
+    /// not replace it with [`DriverError::NotConnected`].
+    fn fail(&self, error_code: ErrorCode) -> DriverError {
+        let error = DriverError::Proto(error_code);
+        if self.driver_result_setter.set(error.clone()) {
+            self.quic_connection
+                .close(utils::varint_w2q(error_code.to_code()), b"");
+        }
+        self.driver_result.get().unwrap_or(error)
+    }
+
     async fn result(&self) -> DriverError {
         match self.driver_result.result().await {
             Some(error) => error,
@@ -259,7 +297,6 @@ mod worker {
         ready_sessions: BiChannelEndpoint<StreamSession>,
         ready_uni_wt_streams: mpsc::Sender<StreamUniRemoteWT>,
         ready_bi_wt_streams: mpsc::Sender<StreamBiRemoteWT>,
-        ready_datagrams: mpsc::Sender<Datagram>,
         driver_result: SharedResultSet<DriverError>,
         local_settings_stream: LocalSettingsStream,
         remote_settings_stream: RemoteSettingsStream,
@@ -275,7 +312,6 @@ mod worker {
             ready_sessions: BiChannelEndpoint<StreamSession>,
             ready_uni_wt_streams: mpsc::Sender<StreamUniRemoteWT>,
             ready_bi_wt_streams: mpsc::Sender<StreamBiRemoteWT>,
-            ready_datagrams: mpsc::Sender<Datagram>,
             driver_result: SharedResultSet<DriverError>,
         ) -> Self {
             Self {
@@ -284,7 +320,6 @@ mod worker {
                 ready_sessions,
                 ready_uni_wt_streams,
                 ready_bi_wt_streams,
-                ready_datagrams,
                 driver_result,
                 local_settings_stream: LocalSettingsStream::empty(),
                 remote_settings_stream: RemoteSettingsStream::empty(),
@@ -304,6 +339,12 @@ mod worker {
 
             debug!("Ended with error: {:?}", error);
 
+            // The result goes first, so that a receive that sees the closed connection finds it. A result that
+            // `Driver::receive_datagram` set first has closed the connection already.
+            if !self.driver_result.set(error.clone()) {
+                return;
+            }
+
             match &error {
                 DriverError::ApplicationClosed(_) => {
                     // Termination procedure
@@ -317,8 +358,6 @@ mod worker {
                 }
                 DriverError::NotConnected => (),
             }
-
-            self.driver_result.set(error);
         }
 
         async fn run_impl(&mut self) -> Result<(), DriverError> {
@@ -339,11 +378,6 @@ mod worker {
                     result = Self::accept_bi(&self.quic_connection,
                                              &ready_bi_h3_streams.0,
                                              &self.ready_bi_wt_streams) => {
-                        result?;
-                    }
-
-                    result = Self::accept_datagram(&self.quic_connection,
-                                                   &self.ready_datagrams) => {
                         result?;
                     }
 
@@ -524,35 +558,6 @@ mod worker {
                 }
                 .instrument(debug_span!("Stream", "id={}", stream_id)),
             );
-
-            Ok(())
-        }
-
-        async fn accept_datagram(
-            quic_connection: &quinn::Connection,
-            ready_datagrams: &mpsc::Sender<Datagram>,
-        ) -> Result<(), DriverError> {
-            let slot = match ready_datagrams.reserve().await {
-                Ok(slot) => slot,
-                Err(mpsc::error::SendError(_)) => return Err(DriverError::NotConnected),
-            };
-
-            let (quic_dgram, rx_time) = quic_connection
-                .read_datagram_with_meta()
-                .await
-                .map_err(|_| DriverError::NotConnected)?;
-
-            let datagram = match Datagram::read(quic_dgram, rx_time) {
-                Ok(datagram) => datagram,
-                Err(error_code) => return Err(DriverError::Proto(error_code)),
-            };
-
-            trace!(
-                "New incoming datagram (session_id: {})",
-                datagram.session_id()
-            );
-
-            slot.send(datagram);
 
             Ok(())
         }

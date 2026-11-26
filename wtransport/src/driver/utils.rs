@@ -1,6 +1,7 @@
 use crate::StreamId;
 use crate::VarInt;
 use std::sync::Arc;
+use std::sync::Weak;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tokio::sync::Mutex;
@@ -85,12 +86,35 @@ where
     /// will be set.
     #[inline(always)]
     pub fn subscribe(&self) -> SharedResultGet<T> {
-        SharedResultGet(Mutex::new(self.0.subscribe()))
+        SharedResultGet(self.0.subscribe())
+    }
+
+    /// A setter that does not keep the shared result open: once every [`SharedResultSet`] is gone, its
+    /// [`WeakResultSet::set`] does nothing, and the subscribers learn that no result was set.
+    #[inline(always)]
+    pub fn downgrade(&self) -> WeakResultSet<T> {
+        WeakResultSet(Arc::downgrade(&self.0))
+    }
+}
+
+/// See [`SharedResultSet::downgrade`].
+#[derive(Debug)]
+pub struct WeakResultSet<T>(Weak<watch::Sender<Option<T>>>);
+
+impl<T> WeakResultSet<T>
+where
+    T: Clone,
+{
+    /// Like [`SharedResultSet::set`], and `false` when every [`SharedResultSet`] is gone.
+    pub fn set(&self, result: T) -> bool {
+        self.0
+            .upgrade()
+            .is_some_and(|sender| SharedResultSet(sender).set(result))
     }
 }
 
 #[derive(Debug)]
-pub struct SharedResultGet<T>(Mutex<watch::Receiver<Option<T>>>);
+pub struct SharedResultGet<T>(watch::Receiver<Option<T>>);
 
 impl<T> SharedResultGet<T>
 where
@@ -104,17 +128,22 @@ where
     /// If all setters are dead before setting any result, this will
     /// return `None`. And all successive calls will return `None`.
     pub async fn result(&self) -> Option<T> {
-        let mut lock = self.0.lock().await;
+        let mut receiver = self.0.clone();
 
         loop {
-            if let Some(result) = lock.borrow().clone() {
+            if let Some(result) = receiver.borrow_and_update().clone() {
                 return Some(result);
             }
 
-            if lock.changed().await.is_err() {
+            if receiver.changed().await.is_err() {
                 return None;
             }
         }
+    }
+
+    /// The shared result if a setter has set it, without waiting.
+    pub fn get(&self) -> Option<T> {
+        self.0.borrow().clone()
     }
 }
 

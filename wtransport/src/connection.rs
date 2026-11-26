@@ -259,6 +259,11 @@ impl Connection {
     /// peer over the connection.
     /// It waits for a datagram to become available and returns the received [`Datagram`].
     ///
+    /// The returned future is cancel safe: dropping it loses no datagram. Only a future that
+    /// is still waiting is woken when a datagram arrives, so code that polls this method by hand,
+    /// such as a `Stream` implementation, must keep the pending future across
+    /// polls instead of creating a new one on each poll.
+    ///
     /// # Example
     ///
     /// ```no_run

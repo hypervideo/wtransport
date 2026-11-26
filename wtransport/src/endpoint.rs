@@ -799,9 +799,244 @@ impl SessionRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ApplicationClose;
     use crate::Identity;
+    use bytes::Bytes;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
     use std::time::Duration;
+    use tokio::time::timeout;
+    use wtransport_proto::error::ErrorCode;
     use wtransport_proto::settings::Settings;
+
+    /// A WebTransport session between a server of this crate and a plain QUIC client, which puts on the wire what a
+    /// test wants. The session's CONNECT stream is the client's first bidirectional stream, so its quarter stream ID is
+    /// 0, and a datagram of the session starts with the byte 0.
+    struct RawSession {
+        server: Connection,
+        client: quinn::Connection,
+        connect: quinn::SendStream,
+        _connect_receive: quinn::RecvStream,
+        _control: quinn::SendStream,
+        _endpoints: (Endpoint<endpoint_side::Server>, quinn::Endpoint),
+    }
+
+    async fn raw_session() -> RawSession {
+        let identity = Identity::self_signed(["localhost"]).unwrap();
+        let certificate_hash = identity.certificate_chain().as_slice()[0].hash();
+        let server = Endpoint::server(
+            ServerConfig::builder()
+                .with_bind_address("127.0.0.1:0".parse().unwrap())
+                .with_identity(identity)
+                .build(),
+        )
+        .unwrap();
+        let server_address = server.local_addr().unwrap();
+        let client_config = ClientConfig::builder()
+            .with_bind_default()
+            .with_server_certificate_hashes([certificate_hash])
+            .build();
+        let client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+
+        let mut settings = Vec::new();
+        Settings::builder()
+            .qpack_max_table_capacity(VarInt::from_u32(0))
+            .qpack_blocked_streams(VarInt::from_u32(0))
+            .enable_connect_protocol()
+            .enable_webtransport()
+            .enable_h3_datagrams()
+            .webtransport_max_sessions(VarInt::from_u32(1))
+            .build()
+            .generate_frame()
+            .write(&mut settings)
+            .unwrap();
+        let mut request = Vec::new();
+        SessionRequestProto::new(format!("https://localhost:{}/", server_address.port()))
+            .unwrap()
+            .headers()
+            .generate_frame()
+            .write(&mut request)
+            .unwrap();
+
+        let (server_connection, (client_connection, control, connect, connect_receive)) = tokio::join!(
+            async {
+                let session_request = timeout(Duration::from_secs(5), server.accept().await)
+                    .await
+                    .expect("the server's handshake finishes")
+                    .expect("the server reads the client's SETTINGS");
+                session_request
+                    .accept()
+                    .await
+                    .expect("the server accepts the session")
+            },
+            async {
+                let connection = client
+                    .connect_with(
+                        client_config.quic_config.clone(),
+                        server_address,
+                        "localhost",
+                    )
+                    .unwrap()
+                    .await
+                    .unwrap();
+                let mut control = connection.open_uni().await.unwrap();
+                // The stream type of a control stream, then the SETTINGS frame.
+                control.write_all(&[0x00]).await.unwrap();
+                control.write_all(&settings).await.unwrap();
+                let (mut connect, connect_receive) = connection.open_bi().await.unwrap();
+                connect.write_all(&request).await.unwrap();
+                (connection, control, connect, connect_receive)
+            },
+        );
+        RawSession {
+            server: server_connection,
+            client: client_connection,
+            connect,
+            _connect_receive: connect_receive,
+            _control: control,
+            _endpoints: (server, client),
+        }
+    }
+
+    async fn receive(
+        connection: &Connection,
+    ) -> Result<crate::datagram::Datagram, ConnectionError> {
+        timeout(Duration::from_secs(5), connection.receive_datagram())
+            .await
+            .expect("the receive ends within 5 s")
+    }
+
+    /// A receive that a caller drops while it waits takes no datagram along: the next receive gets it.
+    #[tokio::test]
+    async fn a_dropped_receive_loses_no_datagram() {
+        let session = raw_session().await;
+        assert!(
+            timeout(Duration::from_millis(50), session.server.receive_datagram())
+                .await
+                .is_err()
+        );
+        session
+            .client
+            .send_datagram(Bytes::from_static(&[0x00, 1, 2]))
+            .unwrap();
+        assert_eq!(
+            &receive(&session.server).await.unwrap().payload()[..],
+            &[1, 2]
+        );
+    }
+
+    /// A datagram of another session is dropped, and the receive returns the next one of its own session.
+    #[tokio::test]
+    async fn a_datagram_of_another_session_is_dropped() {
+        let session = raw_session().await;
+        session
+            .client
+            .send_datagram(Bytes::from_static(&[0x01, 9]))
+            .unwrap();
+        session
+            .client
+            .send_datagram(Bytes::from_static(&[0x00, 7]))
+            .unwrap();
+        assert_eq!(&receive(&session.server).await.unwrap().payload()[..], &[7]);
+    }
+
+    /// A datagram without a valid quarter stream ID closes the connection with `H3_DATAGRAM_ERROR` (RFC 9297, section
+    /// 2.1). Every receive reports that error, and the peer gets it as the close code.
+    #[tokio::test]
+    async fn a_malformed_datagram_closes_the_connection() {
+        let session = raw_session().await;
+        // A variable-length integer of 2^62 - 1, above every quarter stream ID.
+        session
+            .client
+            .send_datagram(Bytes::from_static(&[0xff; 8]))
+            .unwrap();
+        let expected = ConnectionError::local_h3_error(ErrorCode::Datagram);
+        assert_eq!(receive(&session.server).await.unwrap_err(), expected);
+        assert_eq!(receive(&session.server).await.unwrap_err(), expected);
+        match session.client.closed().await {
+            quinn::ConnectionError::ApplicationClosed(close) => {
+                assert_eq!(close.error_code, varint_w2q(ErrorCode::Datagram.to_code()));
+            }
+            error => panic!("unexpected close {error:?}"),
+        }
+    }
+
+    /// A client that finishes its CONNECT stream ends the session with application code 0, and the receive reports
+    /// that, not the local QUIC close that follows it.
+    #[tokio::test]
+    async fn a_finished_connect_stream_ends_the_receive_with_code_zero() {
+        let mut session = raw_session().await;
+        session.connect.finish().unwrap();
+        assert_eq!(
+            receive(&session.server).await.unwrap_err(),
+            ConnectionError::ApplicationClosed(ApplicationClose::new(
+                VarInt::from_u32(0),
+                Box::new([])
+            ))
+        );
+    }
+
+    /// A peer's QUIC close reaches the receive with its code and reason.
+    #[tokio::test]
+    async fn a_peer_close_reaches_the_receive_with_its_code() {
+        let session = raw_session().await;
+        session.client.close(quinn::VarInt::from_u32(7), b"bye");
+        assert_eq!(
+            receive(&session.server).await.unwrap_err(),
+            ConnectionError::ApplicationClosed(ApplicationClose::new(
+                VarInt::from_u32(7),
+                b"bye".to_vec().into_boxed_slice()
+            ))
+        );
+    }
+
+    /// Once the connection has closed, a receive reports how it ended instead of the datagrams that are still
+    /// buffered.
+    #[tokio::test]
+    async fn a_closed_connection_returns_its_error_before_buffered_datagrams() {
+        let session = raw_session().await;
+        for number in 0..5 {
+            session
+                .client
+                .send_datagram(Bytes::from(vec![0x00, number]))
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        session.client.close(quinn::VarInt::from_u32(0), b"");
+        session.server.closed().await;
+        assert!(matches!(
+            receive(&session.server).await,
+            Err(ConnectionError::ApplicationClosed(_))
+        ));
+    }
+
+    /// A task that receives a backlog of datagrams, with no other await in its loop, still lets the other tasks of a
+    /// single-threaded runtime run.
+    #[tokio::test]
+    async fn receiving_a_backlog_yields_to_other_tasks() {
+        let session = raw_session().await;
+        for number in 0..400u16 {
+            let [high, low] = number.to_be_bytes();
+            session
+                .client
+                .send_datagram(Bytes::from(vec![0x00, high, low]))
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let ran = Arc::new(AtomicBool::new(false));
+        tokio::spawn({
+            let ran = ran.clone();
+            async move { ran.store(true, Ordering::Relaxed) }
+        });
+        for _ in 0..300 {
+            receive(&session.server).await.unwrap();
+        }
+        assert!(
+            ran.load(Ordering::Relaxed),
+            "the other task ran while the backlog was received"
+        );
+    }
 
     /// The server reads a client's SETTINGS frame whole when the frame arrives in two parts with the
     /// client's CONNECT stream in between.
@@ -850,7 +1085,7 @@ mod tests {
 
         let (session_request, _client) = tokio::join!(
             async {
-                tokio::time::timeout(Duration::from_secs(5), server.accept().await)
+                timeout(Duration::from_secs(5), server.accept().await)
                     .await
                     .expect("the server's handshake finishes")
                     .expect("the server reads the client's SETTINGS")
